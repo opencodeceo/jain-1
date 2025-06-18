@@ -16,15 +16,10 @@ This document summarizes the features implemented in Phase 1 of the Examify Djan
     *   Authenticated users can upload study materials (files like PDFs, images, etc.) with title, description, and associated course.
     *   Uploaded files are stored in the `/media/study_materials/` directory.
     *   `uploaded_by` field is automatically set to the logged-in user.
-    *   `status` of new materials defaults to 'pending'.
-*   **Content Review System:**
-    *   Admin users can review uploaded study materials.
-    *   Dedicated API endpoint (`/api/core/studymaterials/{id}/review/`) for admins to 'approve' or 'reject' materials.
-    *   Django Admin interface also allows for management and review of materials.
-    *   Users can only view their own pending/rejected materials or globally approved materials. Admins can view all.
+    *   Uploaded materials are directly available based on user roles and relevance (own, course, department).
 *   **Basic Recommendation System:**
-    *   API endpoint (`/api/core/recommendations/`) that suggests 'approved' study materials to authenticated users.
-    *   Recommendations are based on the user's enrolled courses and their department.
+    *   API endpoint (`/api/core/recommendations/`) that suggests study materials to authenticated users.
+    *   Recommendations are based on the user's enrolled courses and their department, drawn from all available materials.
 *   **API Documentation:**
     *   Swagger UI available at `/swagger/`.
     *   ReDoc UI available at `/redoc/`.
@@ -38,16 +33,15 @@ This document summarizes the features implemented in Phase 1 of the Examify Djan
     *   `UserCreateSerializer` extends Djoser's default to create a `UserProfile` instance alongside the `User` instance during registration.
     *   `UserSerializer` extends Djoser's default to include `UserProfile` data when fetching user details and allows updating profile fields via the `/auth/users/me/` endpoint.
 *   **Study Material Access Control (`StudyMaterialViewSet`):**
-    *   `get_queryset()`: Filters materials based on user role (admin vs. regular user) and material status. Regular users see their own non-approved items + all approved items. Admins see everything.
+    *   `get_queryset()`: Filters materials based on user role. Admins see all materials. Regular users see their own uploaded materials, materials relevant to their enrolled courses, and materials relevant to courses in their department.
     *   `perform_create()`: Automatically assigns `request.user` to `uploaded_by`.
-    *   `review` action: Custom action restricted to admins for changing material status.
-    *   Permissions (`IsAdminOrOwner`): Ensures users can only modify/delete their own materials, while admins have full control (status changes are restricted to the `review` action).
+    *   Permissions (`IsAdminOrOwner`): Ensures users can only modify/delete their own materials, while admins have full control.
 *   **Recommendation Logic (`RecommendedMaterialsView`):**
     *   Retrieves the user's `UserProfile` and enrolled `UserCourse`s.
-    *   Constructs a `Q` object to filter approved `StudyMaterial`s:
+    *   Constructs a `Q` object to filter all available `StudyMaterial`s:
         1.  Primary filter: Materials linked to the user's enrolled courses.
         2.  Secondary filter: Materials linked to any course within the user's department.
-    *   If no specific profile criteria lead to recommendations, a fallback (e.g., materials from user's department, or latest approved) is attempted.
+    *   If no specific profile criteria lead to recommendations, a fallback (e.g., materials from user's department) is attempted, or an empty list is returned.
     *   Results are distinct and ordered by upload date.
 
 ## 3. High-Level System Flowchart
@@ -65,20 +59,14 @@ graph TD
 
     subgraph "Study Materials"
         E2[/api/core/studymaterials/];
-        E2 -- Upload (POST) --> G[Pending Material];
+        E2 -- Upload (POST) --> G[Uploaded Material];
         G --> C;
         E2 -- List (GET) --> H[Filtered Materials List];
         H --> C;
     end
 
-    subgraph "Admin Review"
-        I[Admin Client] --> J{Django Admin / Review API};
-        J -- Approve/Reject --> K[Material Status Update];
-        K --> C;
-    end
-
     subgraph "Recommendations"
-        E3[/api/core/recommendations/] --> L[Filtered Approved Materials];
+        E3[/api/core/recommendations/] --> L[Filtered Materials];
         L --> C;
     end
 
@@ -98,12 +86,12 @@ graph TD
     *   `#issue-5`: Add support for tagging study materials with keywords.
 *   **Recommendations:**
     *   `#issue-6`: Enhance recommendation engine (e.g., collaborative filtering, content-based similarity beyond current filters).
-    *   `#issue-7`: Allow users to rate study materials and factor ratings into recommendations.
-*   **Content Management:**
+    *   `#issue-7`: Allow users to rate study materials and factor ratings into recommendations (consider how 'quality' is determined without admin approval).
+*   **Content Management & Quality:**
     *   `#issue-8`: Implement versioning for study materials.
-    *   `#issue-9`: Add notifications to users when their uploaded material is reviewed (approved/rejected).
+    *   `#issue-9`: Develop a system for community feedback or flagging of materials to help identify quality content (replaces admin review).
 *   **Testing:**
-    *   `#issue-10`: Complete unit tests for the recommendation system.
+    *   `#issue-10`: Complete unit tests for the recommendation system (ensure it handles the new "all materials" scope correctly).
     *   `#issue-11`: Add tests for more edge cases in `StudyMaterialViewSet` access permissions.
 *   **AI Integration (Beyond Phase 1):**
     *   `#issue-12`: Integrate NLP for analyzing uploaded materials (as per project doc).

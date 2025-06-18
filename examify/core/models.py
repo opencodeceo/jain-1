@@ -28,18 +28,11 @@ class UserCourse(models.Model):
         return f"{self.user_profile.user.username}'s {self.course.name}"
 
 class StudyMaterial(models.Model):
-    STATUS_CHOICES = [
-        ('pending', 'Pending'),
-        ('approved', 'Approved'),
-        ('rejected', 'Rejected'),
-    ]
-
     title = models.CharField(max_length=200)
     description = models.TextField(null=True, blank=True)
     file = models.FileField(upload_to='study_materials/')
     uploaded_by = models.ForeignKey(User, on_delete=models.CASCADE)
     course = models.ForeignKey(Course, on_delete=models.SET_NULL, null=True, blank=True)
-    status = models.CharField(max_length=10, choices=STATUS_CHOICES, default='pending')
     upload_date = models.DateTimeField(auto_now_add=True)
 
     def __str__(self):

@@ -50,7 +50,7 @@ class UserProfileViewSet(viewsets.ModelViewSet):
 class StudyMaterialViewSet(viewsets.ModelViewSet):
     """
     Handles CRUD operations for Study Materials.
-    Users can upload materials, which are then reviewed by admins.
+    Uploaded materials are directly available based on visibility rules.
     File uploads should use multipart/form-data.
     """
     queryset = StudyMaterial.objects.all()
@@ -62,70 +62,83 @@ class StudyMaterialViewSet(viewsets.ModelViewSet):
         Instantiates and returns the list of permissions that this view requires.
         - 'list', 'create': Authenticated users.
         - 'retrieve', 'update', 'partial_update', 'destroy': Admin or Owner.
-        - 'review': Admin only.
         """
         if self.action in ['list', 'create']:
             self.permission_classes = [permissions.IsAuthenticated]
         elif self.action in ['retrieve', 'update', 'partial_update', 'destroy']:
             self.permission_classes = [IsAdminOrOwner]
-        elif self.action == 'review':
-            self.permission_classes = [IsAdminUser]
         else:
-            self.permission_classes = [permissions.IsAuthenticated] # Default
+            self.permission_classes = [permissions.IsAuthenticated] # Default for other actions
         return super().get_permissions()
 
     def perform_create(self, serializer):
         """
         Allows authenticated users to upload new study materials.
         `uploaded_by` is set to the current user.
-        Status defaults to 'pending' as per model definition.
         """
         serializer.save(uploaded_by=self.request.user)
 
     def perform_update(self, serializer):
         """
         Allows the owner or an admin to update material details (e.g., title, description).
-        Status cannot be changed here by non-admins due to serializer field being read-only.
-        Admins use the 'review' action to change status.
         """
         serializer.save()
 
     def get_queryset(self):
         """
         Lists study materials.
-        - Regular users see their own pending/rejected materials and all approved materials.
         - Admins see all materials.
+        - Regular users see their own uploaded materials, materials for their enrolled courses,
+          and materials from courses in their department.
         """
         user = self.request.user
-        if user.is_staff:
+        if user.is_staff: # Admins see all materials
             return StudyMaterial.objects.all().order_by('-upload_date')
-        return StudyMaterial.objects.filter(
-            Q(uploaded_by=user) | Q(status='approved')
-        ).distinct().order_by('-upload_date')
 
-    @action(detail=True, methods=['post'], permission_classes=[IsAdminUser])
-    def review(self, request, pk=None):
-        """
-        Allows admin users to approve or reject a study material.
-        Expects `{"status": "approved"}` or `{"status": "rejected"}` in the request body.
-        """
-        material = self.get_object()
-        new_status = request.data.get('status')
+        # For regular users:
+        # 1. Their own uploaded materials
+        own_materials = Q(uploaded_by=user)
 
-        if new_status not in ['approved', 'rejected']: # Simpler check
-            return Response(
-                {'error': 'Invalid status value. Must be "approved" or "rejected".'},
-                status=http_status.HTTP_400_BAD_REQUEST
-            )
+        # Initialize Q objects for optional filters
+        relevant_course_materials = Q()
+        department_materials = Q()
 
-        material.status = new_status
-        material.save()
-        return Response(StudyMaterialSerializer(material).data)
+        # 2. Materials relevant to their enrolled courses
+        try:
+            user_profile = user.userprofile
+            user_courses_ids = list(UserCourse.objects.filter(user_profile=user_profile).values_list('course_id', flat=True))
+            if user_courses_ids:
+                relevant_course_materials = Q(course__id__in=user_courses_ids)
+        except UserProfile.DoesNotExist:
+            pass # No profile, so no course-based materials from enrollment
+
+        # 3. Materials relevant to courses in their department
+        try:
+            # Ensure user_profile is available; it might have been fetched above or not.
+            # This could be optimized by fetching user_profile once.
+            user_profile = getattr(user, 'userprofile', None) or user.userprofile
+            if user_profile and user_profile.department:
+                department_courses_ids = list(Course.objects.filter(department=user_profile.department).values_list('id', flat=True))
+                if department_courses_ids:
+                    department_materials = Q(course__id__in=department_courses_ids)
+        except UserProfile.DoesNotExist:
+            pass # No profile, so no department-based materials
+
+        # Combine the conditions with OR
+        combined_filters = own_materials | relevant_course_materials | department_materials
+
+        # Ensure that if all Q objects are empty (e.g. new user with no profile data, no uploads)
+        # it doesn't result in an empty filter call that might behave unexpectedly.
+        # However, an empty Q object in a filter is typically a no-op, so it should be fine.
+        # If combined_filters has no children, it means only own_materials could potentially be non-empty
+        # or all are empty. If own_materials is also empty, filter will correctly return nothing.
+
+        return StudyMaterial.objects.filter(combined_filters).distinct().order_by('-upload_date')
 
 class RecommendedMaterialsView(generics.ListAPIView):
     """
-    Provides a list of approved study materials recommended to the authenticated user.
-    Recommendations are based on the user's enrolled courses and their department.
+    Provides a list of study materials recommended to the authenticated user.
+    Recommendations are based on the user's enrolled courses and department, drawn from all available materials.
     """
     serializer_class = StudyMaterialSerializer
     permission_classes = [permissions.IsAuthenticated]
@@ -133,15 +146,10 @@ class RecommendedMaterialsView(generics.ListAPIView):
     def get_queryset(self):
         """
         Returns a queryset of StudyMaterial objects recommended for the current user.
-        Filters by approved materials relevant to user's courses and department.
+        Filters all available materials based on relevance to user's courses and department.
         """
         user = self.request.user
         try:
-            # Ensure related_name is 'userprofile' or adjust if it's different.
-            # Default is <classname>_set, but for OneToOneField, it's often just the classname.
-            # If User.userprofile doesn't work, it might be User.profile or whatever was defined/defaulted.
-            # Let's assume it's user.userprofile as per common practice when related_name isn't explicitly set
-            # on the OneToOneField in UserProfile to User.
             user_profile = user.userprofile
         except UserProfile.DoesNotExist:
             return StudyMaterial.objects.none() # No profile, no recommendations
@@ -149,11 +157,13 @@ class RecommendedMaterialsView(generics.ListAPIView):
         # Fetch user's courses
         user_courses_ids = list(UserCourse.objects.filter(user_profile=user_profile).values_list('course_id', flat=True))
 
-        # Base query: only approved materials
-        queryset = StudyMaterial.objects.filter(status='approved')
+        # Base query: all materials (no longer filtering by status='approved')
+        queryset = StudyMaterial.objects.all()
 
         # Filter conditions
-        filters = Q()
+        filters = Q() # Initialize with an empty Q object; will be an "AND" if not empty.
+                      # Or, if we want to ensure at least one condition matches, might start differently.
+                      # For "OR" logic as before for course/dept, this is fine.
 
         # 1. Materials for user's enrolled courses
         if user_courses_ids:
@@ -166,18 +176,19 @@ class RecommendedMaterialsView(generics.ListAPIView):
                 filters |= Q(course__id__in=department_courses_ids)
 
         # If no specific filters are matched from profile (e.g., no courses, no department, or courses/department have no materials)
-        if not filters.children: # Check if any conditions were added to Q object
-            # Fallback: Show approved materials from their department if they have one
-            if user_profile.department:
-                 department_courses_ids = list(Course.objects.filter(department=user_profile.department).values_list('id', flat=True))
-                 if department_courses_ids:
-                    return queryset.filter(course__id__in=department_courses_ids).distinct().order_by('-upload_date')
-                 else: # Department exists but has no courses, or courses have no materials
-                    return StudyMaterial.objects.none()
-            else:
-                # If no department, maybe return latest approved materials, or none if too broad
-                # Returning none for now to be more specific. Could return all approved as a last resort.
+        if not filters.children: # If no course or department filters could be formed
+            # If user has no courses and no department, or those have no materials,
+            # this would return ALL study materials. This might be too broad.
+            # Let's return an empty set if no specific criteria are met.
+            # Alternatively, a fallback to "latest N materials" regardless of relevance could be an option.
+            # For now, require some relevance.
+            if not user_courses_ids and not (user_profile and user_profile.department):
+                 return StudyMaterial.objects.none()
+            # If filters is still empty here, it implies user might have courses/dept, but they yielded no materials.
+            # Returning queryset.filter(filters) would effectively return all if filters is truly empty.
+            # So, if filters is empty (no criteria applied), return none.
+            if not filters.children: # Check again, as department_courses_ids might not have added to filters
                 return StudyMaterial.objects.none()
-                # return queryset.order_by('-upload_date')[:20] # Example: limit to latest 20 general approved
+
 
         return queryset.filter(filters).distinct().order_by('-upload_date')
