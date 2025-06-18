@@ -154,4 +154,4 @@ The **AI-Powered Exam Preparation App** is designed to assist students in prepar
 
 ## 7. Conclusion
 
-The AI-Powered Exam Preparation App transforms student study experiences with personalized learning, interactive AI assistance, and a growing library of resources. By leveraging advanced AI models and a robust technical framework, it ensures scalability and relevance. This documentation serves as a blueprint for development and can be modified as needed.
+The AI-Powered Exam Preparation App transforms student study experiences with personalized learning, interactive AI assistance, and a growing library of resources. By leveraging advanced AI models and a robust technical framework, it ensures scalability and relevance. This documentation serves as a blueprint for development and can be modified.
