@@ -57,20 +57,17 @@ class StudyMaterialSerializer(serializers.ModelSerializer):
     """
     Serializer for the StudyMaterial model.
     - `uploaded_by`: Read-only field, automatically set to the logged-in user upon creation (in the ViewSet).
-    - `status`: Read-only for users during creation/update (defaults to 'pending').
-                 Admins manage status via the 'review' action in the StudyMaterialViewSet.
     - `file`: Handled by DRF's FileField for uploads.
     """
     uploaded_by = serializers.ReadOnlyField(source='uploaded_by.username')
-    status = serializers.CharField(read_only=True, required=False, help_text="Material status, defaults to 'pending'. Admins change via review action.")
+    # status field has been removed from the model
 
     class Meta:
         model = StudyMaterial
-        fields = ('id', 'title', 'description', 'file', 'course', 'status', 'upload_date', 'uploaded_by')
+        fields = ('id', 'title', 'description', 'file', 'course', 'upload_date', 'uploaded_by')
         # `course` field will be a PrimaryKeyRelatedField by default.
         # `upload_date` is read-only by model definition (auto_now_add=True)
 
     def create(self, validated_data):
         # `uploaded_by` is set in the ViewSet's perform_create method.
-        # `status` uses its model default ('pending').
         return super().create(validated_data)
