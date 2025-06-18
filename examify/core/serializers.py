@@ -71,3 +71,6 @@ class StudyMaterialSerializer(serializers.ModelSerializer):
     def create(self, validated_data):
         # `uploaded_by` is set in the ViewSet's perform_create method.
         return super().create(validated_data)
+
+class AIQuerySerializer(serializers.Serializer):
+    query = serializers.CharField(max_length=2000, help_text="The user's query for the AI tutor.")

@@ -192,3 +192,108 @@ class RecommendedMaterialsView(generics.ListAPIView):
 
 
         return queryset.filter(filters).distinct().order_by('-upload_date')
+
+
+from rest_framework.views import APIView
+# from rest_framework.response import Response # Already imported
+# from rest_framework import status # Already imported as http_status
+# from rest_framework import permissions # Already imported
+from .serializers import AIQuerySerializer # Import the new serializer
+from .ai_processing import perform_rag_query # Import the RAG service
+from django.conf import settings # To access settings for API key checks
+import logging # Import logging
+
+logger = logging.getLogger(__name__) # Define logger for this module
+
+
+class AITutorQueryView(APIView):
+    """
+    Provides an interface to the AI Tutor powered by a Retrieval Augmented Generation (RAG) system.
+
+    **POST:**
+    Submit a query to receive an answer based on the processed study materials.
+
+    **Request Body:**
+    ```json
+    {
+        "query": "Your question about the study materials."
+    }
+    ```
+
+    **Responses:**
+    - `200 OK`: Successful query, answer provided.
+      ```json
+      {
+          "answer": "The AI-generated answer."
+      }
+      ```
+    - `400 Bad Request`: Invalid input (e.g., missing query).
+      ```json
+      {
+          "query": ["This field is required."]
+      }
+      ```
+    - `503 Service Unavailable`: AI services are not configured by the administrator or a temporary issue with an external AI service.
+      ```json
+      {
+          "error": "AI services are not configured by the administrator."
+          // or "AI service error: specific message from RAG pipeline"
+      }
+      ```
+    - `500 Internal Server Error`: An unexpected error occurred, or an error within the AI processing pipeline.
+      ```json
+      {
+          "error": "An unexpected error occurred while processing your query."
+          // or "AI processing error: specific message from RAG pipeline"
+      }
+      ```
+    """
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = AIQuerySerializer # Inform drf-yasg about the serializer for request body
+
+    def post(self, request, *args, **kwargs):
+        """
+        Accepts a user's query and returns an AI-generated answer.
+        The query is processed by a RAG pipeline leveraging uploaded study materials.
+        """
+        serializer = self.serializer_class(data=request.data) # Use self.serializer_class
+        if serializer.is_valid():
+            user_query = serializer.validated_data['query']
+
+            # Check for placeholder API keys before calling RAG
+            # This check can be more robust, e.g. on app startup or a dedicated health check endpoint
+
+            google_embedding_used = getattr(settings, 'PREFERRED_EMBEDDING_PROVIDER', None) == 'google'
+            google_llm_used = getattr(settings, 'PREFERRED_LLM_PROVIDER', None) == 'google'
+            openai_embedding_used = getattr(settings, 'PREFERRED_EMBEDDING_PROVIDER', None) == 'openai'
+            openai_llm_used = getattr(settings, 'PREFERRED_LLM_PROVIDER', None) == 'openai'
+
+            if (google_embedding_used or google_llm_used) and \
+               (settings.GOOGLE_API_KEY == "YOUR_GOOGLE_API_KEY" or not settings.GOOGLE_API_KEY):
+                return Response(
+                    {"error": "Google AI services are not configured by the administrator."},
+                    status=http_status.HTTP_503_SERVICE_UNAVAILABLE
+                )
+
+            if (openai_embedding_used or openai_llm_used) and \
+               (settings.OPENAI_API_KEY == "YOUR_OPENAI_API_KEY" or not settings.OPENAI_API_KEY):
+                return Response(
+                    {"error": "OpenAI services are not configured by the administrator."},
+                    status=http_status.HTTP_503_SERVICE_UNAVAILABLE
+                )
+
+            try:
+                answer = perform_rag_query(user_query)
+                if isinstance(answer, str) and answer.startswith("Error:"):
+                    if "not configured" in answer or "API Key" in answer or "settings" in answer.lower():
+                        return Response({"error": "AI service error: " + answer}, status=http_status.HTTP_503_SERVICE_UNAVAILABLE)
+                    return Response({"error": "AI processing error: " + answer}, status=http_status.HTTP_500_INTERNAL_SERVER_ERROR)
+                return Response({"answer": answer}, status=http_status.HTTP_200_OK)
+            except Exception as e:
+                # Log the exception e with a proper logger in a real app
+                logger.error(f"Unhandled exception in AITutorQueryView: {e}", exc_info=True)
+                return Response(
+                    {"error": "An unexpected error occurred while processing your query."},
+                    status=http_status.HTTP_500_INTERNAL_SERVER_ERROR
+                )
+        return Response(serializer.errors, status=http_status.HTTP_400_BAD_REQUEST)

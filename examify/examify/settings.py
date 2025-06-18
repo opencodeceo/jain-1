@@ -151,3 +151,16 @@ DJOSER = {
 
 MEDIA_URL = '/media/'
 MEDIA_ROOT = BASE_DIR / 'media'
+
+# AI Service Configurations
+GOOGLE_API_KEY = "YOUR_GOOGLE_API_KEY"  # Placeholder, use environment variables
+GOOGLE_CLOUD_PROJECT = "YOUR_GOOGLE_CLOUD_PROJECT"
+GOOGLE_CLOUD_REGION = "YOUR_GOOGLE_CLOUD_REGION" # e.g., us-central1
+VERTEX_AI_INDEX_ID = "YOUR_VERTEX_AI_INDEX_ID" # Placeholder for the actual index ID
+VERTEX_AI_INDEX_ENDPOINT_ID = "YOUR_VERTEX_AI_INDEX_ENDPOINT_ID" # Placeholder for the index endpoint
+
+OPENAI_API_KEY = "YOUR_OPENAI_API_KEY"    # Placeholder, use environment variables
+
+# Preferred embedding/LLM services ('google' or 'openai')
+PREFERRED_EMBEDDING_PROVIDER = 'google' # or 'openai'
+PREFERRED_LLM_PROVIDER = 'google' # or 'openai'
