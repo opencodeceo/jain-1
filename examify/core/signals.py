@@ -2,7 +2,7 @@ import logging
 from django.db.models.signals import post_save
 from django.dispatch import receiver
 from django.db.models import Avg, F # Import F for atomic updates
-from .models import MockExamAttempt, StudyMaterial, UserProfile, ActivityLog # Add ActivityLog
+from .models import MockExamAttempt, StudyMaterial, UserProfile, ActivityLog, AIFeedback, DocumentChunk # Ensure AIFeedback and DocumentChunk are imported
 import logging
 
 logger = logging.getLogger(__name__)
@@ -138,3 +138,38 @@ def update_progress_on_material_upload(sender, instance, created, **kwargs):
                 logger.error(f"Error awarding points or updating material count for user {instance.uploaded_by.username} (material upload): {e}", exc_info=True)
         else:
             logger.warning(f"StudyMaterial {instance.id} created with no 'uploaded_by' user. Cannot update progress or award points.")
+
+
+@receiver(post_save, sender=AIFeedback)
+def update_document_chunk_flags_on_feedback(sender, instance, created, **kwargs):
+    """
+    Updates DocumentChunk review_flags_count based on AIFeedback.
+    If feedback has a low rating (<=2) or ai_low_confidence is True,
+    increment review_flags_count for all associated context_chunks.
+    """
+    if created: # Only process on new feedback creation
+        increment_flag = False
+        log_message_parts = []
+
+        if instance.rating is not None and instance.rating <= 2:
+            increment_flag = True
+            log_message_parts.append(f"low rating ({instance.rating})")
+
+        if instance.ai_low_confidence:
+            increment_flag = True
+            log_message_parts.append("AI low confidence flag")
+
+        if increment_flag and instance.context_chunks.exists():
+            reason_for_flagging = " and ".join(log_message_parts)
+            logger.info(f"Feedback ID {instance.id} (session: {instance.session_id}) triggered review flag due to {reason_for_flagging}. Updating context chunk flags.")
+
+            # Iterate and update. Using .update() on queryset is more efficient for batch updates.
+            chunk_ids_to_update = list(instance.context_chunks.values_list('id', flat=True))
+            if chunk_ids_to_update:
+                updated_count = DocumentChunk.objects.filter(id__in=chunk_ids_to_update).update(review_flags_count=F('review_flags_count') + 1)
+                logger.info(f"Incremented review_flags_count for {updated_count} DocumentChunk(s) linked to Feedback ID {instance.id}.")
+                # Log individual chunks if needed for very detailed tracing, but batch update is better.
+                # for chunk_id in chunk_ids_to_update:
+                #    logger.info(f"Incremented review_flags_count for DocumentChunk ID {chunk_id}.")
+        elif increment_flag: # Low rating or AI low confidence, but no context chunks linked
+             logger.info(f"Feedback ID {instance.id} (session: {instance.session_id}) had {reason_for_flagging}, but no context chunks were linked to update.")

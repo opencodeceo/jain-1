@@ -1,6 +1,7 @@
 from django.db import models
 from django.contrib.auth.models import User
 from django.conf import settings # Import settings
+import uuid # For AIFeedback session_id
 
 class UserProfile(models.Model):
     user = models.OneToOneField(User, on_delete=models.CASCADE)
@@ -56,6 +57,7 @@ class DocumentChunk(models.Model):
                                        help_text="Embedding provider used for this chunk (e.g., 'google', 'openai')")
     chunk_sequence_number = models.PositiveIntegerField(default=0,
                                                     help_text="Order of the chunk within the document")
+    review_flags_count = models.PositiveIntegerField(default=0, help_text="Number of times this chunk was associated with negative feedback or low AI confidence.")
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -160,6 +162,25 @@ class ActivityLog(models.Model):
         ordering = ['-timestamp']
 
 
+class ImageQuery(models.Model):
+    STATUS_CHOICES = [
+        ('pending', 'Pending'),
+        ('processing', 'Processing'),
+        ('completed', 'Completed'),
+        ('failed', 'Failed'),
+    ]
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False) # Use UUID as primary key
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='image_queries')
+    image = models.ImageField(upload_to='image_queries/%Y/%m/%d/')
+    extracted_text = models.TextField(null=True, blank=True)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='pending')
+    timestamp = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return f"ImageQuery {self.id} by {self.user.username} ({self.status})"
+
+
 class StudyGroup(models.Model):
     name = models.CharField(max_length=200)
     description = models.TextField(blank=True, null=True)
@@ -190,3 +211,41 @@ class StudyGroupMembership(models.Model):
 
     def __str__(self):
         return f"{self.user.username} in {self.group.name} as {self.get_role_display()}"
+
+
+class AIFeedback(models.Model):
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
+                             help_text="User who provided the feedback. Null if anonymous.")
+    # session_id can link a query to its response and then to the feedback.
+    # Useful for feedback on RAG answers or specific AI interactions.
+    session_id = models.UUIDField(default=uuid.uuid4, editable=False, db_index=True,
+                                  help_text="Unique ID for an AI interaction session (e.g., a query-response pair).")
+
+    # Optional: Storing the query and response text for which feedback is given.
+    # This provides context directly within the feedback entry.
+    query_text = models.TextField(blank=True, null=True, help_text="The user's query that led to the AI response.")
+    ai_response_text = models.TextField(blank=True, null=True, help_text="The AI's response that is being reviewed.")
+
+    rating = models.PositiveSmallIntegerField(null=True, blank=True,
+                                           help_text="User rating (e.g., 1-5 stars).")
+    feedback_comment = models.TextField(blank=True, null=True, help_text="User's textual feedback or comments.")
+
+    # Optional: Link to specific DocumentChunks if feedback is about context used in RAG
+    # This could be a ManyToManyField if multiple chunks were involved.
+    # For simplicity, can be added later if direct linking is essential for analysis.
+    # relevant_chunks = models.ManyToManyField('DocumentChunk', blank=True, related_name='feedback_instances')
+
+    # Optional: What type of AI interaction is this feedback for?
+    # E.g., 'rag_answer', 'ai_exam_grading', 'summarization'
+    interaction_type = models.CharField(max_length=50, blank=True, null=True, db_index=True)
+    context_chunks = models.ManyToManyField('DocumentChunk', blank=True, related_name='feedback_instances',
+                                          help_text="Document chunks used as context for the AI response this feedback is for.")
+    ai_low_confidence = models.BooleanField(default=False, help_text="Flagged if AI indicated low confidence in its response.")
+
+    timestamp = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return f"Feedback by {self.user.username if self.user else 'Anonymous'} on session {self.session_id} (Rating: {self.rating})"
+
+    class Meta:
+        ordering = ['-timestamp']
