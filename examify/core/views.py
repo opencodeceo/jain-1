@@ -135,6 +135,82 @@ class StudyMaterialViewSet(viewsets.ModelViewSet):
 
         return StudyMaterial.objects.filter(combined_filters).distinct().order_by('-upload_date')
 
+    @action(detail=True, methods=['post'], url_path='summarize', permission_classes=[permissions.IsAuthenticated])
+    def summarize_material(self, request, pk=None):
+        """
+        Generates a summary for the text content of this study material using an AI model.
+
+        This endpoint processes the entire material's text content. For very large materials,
+        this operation can be resource-intensive and might take some time.
+        Consider using this for materials of reasonable length or when asynchronous processing
+        is implemented on the backend.
+
+        **Response:**
+        - `200 OK`: Summary successfully generated.
+          ```json
+          {
+              "summary": "The AI-generated summary of the material."
+          }
+          ```
+        - `400 Bad Request`: If the study material has no file or content cannot be extracted.
+        - `404 Not Found`: If the study material does not exist.
+        - `500 Internal Server Error`: If an AI service error or other unexpected error occurs.
+        - `503 Service Unavailable`: If AI services are not configured by the administrator.
+        """
+        try:
+            study_material = self.get_object() # This applies ViewSet's permission checks
+            if not study_material.file or not hasattr(study_material.file, 'path'):
+                logger.warning(f"Study material {pk} has no associated file or file path for summarization.")
+                return Response({"error": "Study material has no associated file or file path cannot be determined."},
+                                status=http_status.HTTP_400_BAD_REQUEST)
+
+            file_path = study_material.file.path
+            file_name = study_material.file.name
+            file_type = file_name.split('.')[-1].lower() if '.' in file_name else ''
+
+            logger.info(f"Attempting to summarize material ID {pk}, file: {file_name}")
+
+            # Using functions from ai_processing module
+            text_content = extract_text_from_file(file_path, file_type)
+
+            if not text_content or not text_content.strip():
+                logger.warning(f"Could not extract text content from material ID {pk} for summarization.")
+                return Response({"error": "Could not extract text content from the material."},
+                                status=http_status.HTTP_400_BAD_REQUEST)
+
+            preferred_llm_provider = getattr(settings, 'PREFERRED_LLM_PROVIDER', 'google')
+            if preferred_llm_provider == 'google' and \
+               (settings.GOOGLE_API_KEY == "YOUR_GOOGLE_API_KEY" or not settings.GOOGLE_API_KEY):
+                logger.error(f"Summarization failed for material ID {pk}: Google AI services are not configured.")
+                return Response({"error": "Google AI services are not configured by the administrator."},
+                                status=http_status.HTTP_503_SERVICE_UNAVAILABLE)
+            elif preferred_llm_provider == 'openai' and \
+                 (settings.OPENAI_API_KEY == "YOUR_OPENAI_API_KEY" or not settings.OPENAI_API_KEY):
+                logger.error(f"Summarization failed for material ID {pk}: OpenAI services are not configured.")
+                return Response({"error": "OpenAI services are not configured by the administrator."},
+                                status=http_status.HTTP_503_SERVICE_UNAVAILABLE)
+
+            logger.info(f"Calling summarize_text_with_llm for material ID {pk}, text length: {len(text_content)}")
+            summary = summarize_text_with_llm(text_content, provider=preferred_llm_provider)
+
+            if isinstance(summary, str) and summary.startswith("Error:"):
+                logger.error(f"Summarization failed for material ID {pk}: {summary}")
+                if "not configured" in summary or "API Key" in summary:
+                    return Response({"error": f"AI service error: {summary}"}, status=http_status.HTTP_503_SERVICE_UNAVAILABLE)
+                return Response({"error": f"AI processing error: {summary}"}, status=http_status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+            logger.info(f"Successfully generated summary for material ID {pk}")
+            return Response({"summary": summary, "study_material_id": pk}, status=http_status.HTTP_200_OK)
+
+        except StudyMaterial.DoesNotExist:
+            logger.warning(f"Attempt to summarize non-existent study material {pk}") # Should be caught by get_object
+            return Response({"error": "Study material not found."}, status=http_status.HTTP_404_NOT_FOUND)
+        except Exception as e:
+            logger.error(f"Error summarizing study material ID {pk}: {e}", exc_info=True)
+            return Response({"error": "An unexpected error occurred during summarization."},
+                            status=http_status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
 class RecommendedMaterialsView(generics.ListAPIView):
     """
     Provides a list of study materials recommended to the authenticated user.
@@ -198,10 +274,11 @@ from rest_framework.views import APIView
 # from rest_framework.response import Response # Already imported
 # from rest_framework import status # Already imported as http_status
 # from rest_framework import permissions # Already imported
-from .serializers import AIQuerySerializer
-from .ai_processing import perform_rag_query, grade_answer_with_ai # Import grade_answer_with_ai
+from .serializers import AIQuerySerializer # Ensure this is not duplicated if already imported
+from .ai_processing import perform_rag_query, grade_answer_with_ai, summarize_text_with_llm, extract_text_from_file
 from django.conf import settings
 import logging
+import uuid # Add this import
 
 logger = logging.getLogger(__name__) # Define logger for this module
 
@@ -283,14 +360,32 @@ class AITutorQueryView(APIView):
                 )
 
             try:
-                answer = perform_rag_query(user_query)
-                if isinstance(answer, str) and answer.startswith("Error:"):
-                    if "not configured" in answer or "API Key" in answer or "settings" in answer.lower():
-                        return Response({"error": "AI service error: " + answer}, status=http_status.HTTP_503_SERVICE_UNAVAILABLE)
-                    return Response({"error": "AI processing error: " + answer}, status=http_status.HTTP_500_INTERNAL_SERVER_ERROR)
-                return Response({"answer": answer}, status=http_status.HTTP_200_OK)
+                rag_result = perform_rag_query(user_query) # Now returns a dictionary
+                answer = rag_result.get("answer")
+                context_vector_ids = rag_result.get("context_vector_ids", [])
+                error_message = rag_result.get("error")
+
+                if error_message:
+                    logger.error(f"Error from perform_rag_query (Session ID: {session_id}): {error_message}")
+                    # Distinguish between configuration errors and other processing errors based on message content
+                    if "not configured" in error_message or "API Key" in error_message or "settings" in error_message.lower():
+                        return Response({"error": "AI service error: " + error_message, "session_id": str(session_id)},
+                                        status=http_status.HTTP_503_SERVICE_UNAVAILABLE)
+                    return Response({"error": "AI processing error: " + error_message, "session_id": str(session_id)},
+                                    status=http_status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+                # If there's an answer, even if context_vector_ids is empty (e.g., LLM answered without specific RAG context)
+                if answer is not None:
+                    return Response({
+                        "answer": answer,
+                        "session_id": str(session_id),
+                        "context_vector_ids": context_vector_ids
+                    }, status=http_status.HTTP_200_OK)
+                else: # Should ideally be caught by error_message, but as a fallback
+                    logger.error(f"perform_rag_query returned None for answer without an error message (Session ID: {session_id})")
+                    return Response({"error": "AI processing error: Received no answer or error from RAG service.", "session_id": str(session_id)},
+                                    status=http_status.HTTP_500_INTERNAL_SERVER_ERROR)
             except Exception as e:
-                # Log the exception e with a proper logger in a real app
                 logger.error(f"Unhandled exception in AITutorQueryView: {e}", exc_info=True)
                 return Response(
                     {"error": "An unexpected error occurred while processing your query."},
@@ -557,3 +652,139 @@ class MockExamAttemptViewSet(viewsets.GenericViewSet,
 
         result_serializer = MockExamAttemptSerializer(attempt) # Use the ViewSet's default serializer for the attempt
         return Response({"message": "Answers submitted and processed.", "attempt": result_serializer.data}, status=http_status.HTTP_200_OK)
+
+
+# --- AI Feedback View ---
+from .serializers import AIFeedbackSerializer # Import new serializer
+from .models import AIFeedback # Import AIFeedback model
+
+class AIFeedbackSubmitView(generics.CreateAPIView):
+    """
+    Allows authenticated users to submit feedback on AI interactions.
+
+    Feedback can include a rating, textual comments, and references to the specific
+    AI interaction session and context materials used. This data is crucial for
+    improving the AI's performance and content quality.
+
+    **Request Body:**
+    ```json
+    {
+        "session_id": "uuid-of-the-ai-interaction",
+        "query_text": "(Optional) The user's query that led to the AI response.",
+        "ai_response_text": "(Optional) The AI's response being reviewed.",
+        "rating": 4, // Integer, e.g., 1-5
+        "feedback_comment": "(Optional) Detailed textual feedback.",
+        "interaction_type": "(Optional) e.g., 'rag_query', 'ai_exam_grading'",
+        "context_vector_ids": ["vector_id1", "vector_id2"], // Optional list of vector_ids for context chunks
+        "ai_low_confidence": false // Optional boolean
+    }
+    ```
+
+    **Response:**
+    - `201 Created`: Feedback successfully submitted. Returns the created feedback object.
+    - `400 Bad Request`: Invalid input data (e.g., rating out of range, missing required fields if any beyond default).
+    - `401 Unauthorized`: If the user is not authenticated.
+    """
+    queryset = AIFeedback.objects.all()
+    serializer_class = AIFeedbackSerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+
+# --- OCR View ---
+from .models import ImageQuery # Already imported with AIFeedback, but good to note dependency
+from .serializers import ImageQuerySerializer, ImageQueryUploadSerializer
+from .ai_processing import extract_text_from_image_gcp
+
+class OCRQueryView(generics.CreateAPIView):
+    """
+    Allows authenticated users to upload an image file to perform Optical Character Recognition (OCR)
+    and extract text content from it.
+
+    The extracted text can subsequently be used for other AI processing tasks, such as
+    feeding it into the RAG (Retrieval Augmented Generation) system for queries.
+
+    **Request (multipart/form-data):**
+    - `image`: The image file to be processed.
+
+    **Response (`201 Created` on successful upload and processing attempt):**
+    Returns the `ImageQuery` object, which includes the processing status and extracted text (if any).
+    ```json
+    {
+        "id": "uuid-of-the-image-query",
+        "user": "username",
+        "image": "/media/image_queries/YYYY/MM/DD/filename.jpg", // URL to the uploaded image
+        "extracted_text": "The text extracted from the image by OCR...",
+        "status": "completed", // or "pending", "processing", "failed"
+        "timestamp": "YYYY-MM-DDTHH:MM:SS.ffffffZ",
+        "updated_at": "YYYY-MM-DDTHH:MM:SS.ffffffZ"
+    }
+    ```
+    - `400 Bad Request`: If no image file is provided or the file is invalid.
+    - `401 Unauthorized`: If the user is not authenticated.
+    - `503 Service Unavailable`: If OCR services (e.g., Google Cloud Vision API) are not configured.
+    """
+    queryset = ImageQuery.objects.all()
+    # get_serializer_class will determine which serializer to use
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get_serializer_class(self):
+        if self.request.method == 'POST':
+            return ImageQueryUploadSerializer # Use this for creating/uploading
+        return ImageQuerySerializer # Default for other methods if any (though CreateAPIView is POST only)
+
+    def perform_create(self, serializer):
+        image_query_instance = serializer.save(user=self.request.user, status='pending')
+        logger.info(f"ImageQuery {image_query_instance.id} created by user {self.request.user.username}, status pending.")
+
+        try:
+            image_query_instance.status = 'processing'
+            image_query_instance.save(update_fields=['status', 'updated_at'])
+
+            image_file = image_query_instance.image
+            # Ensure file pointer is at the beginning if it has been read before (though not in this flow for new upload)
+            image_file.seek(0)
+            image_content_bytes = image_file.read()
+
+            extracted_text = extract_text_from_image_gcp(image_content_bytes)
+
+            if extracted_text is not None: # Check for None which indicates an error during extraction
+                image_query_instance.extracted_text = extracted_text
+                image_query_instance.status = 'completed' if extracted_text else 'completed' # Still completed if no text found by OCR
+                logger.info(f"ImageQuery {image_query_instance.id} OCR successful. Text found length: {len(extracted_text)}")
+            else: # OCR process itself failed
+                image_query_instance.status = 'failed'
+                image_query_instance.extracted_text = "OCR process resulted in an error." # Generic error for user
+                logger.error(f"ImageQuery {image_query_instance.id} OCR failed (extractor returned None).")
+
+            image_query_instance.save(update_fields=['extracted_text', 'status', 'updated_at'])
+            logger.info(f"ImageQuery {image_query_instance.id} processing finished with status: {image_query_instance.status}")
+
+        except Exception as e:
+            logger.error(f"Error during OCR processing for ImageQuery {image_query_instance.id}: {e}", exc_info=True)
+            # Ensure instance is saved if not already, or update if it is
+            if image_query_instance and image_query_instance.pk: # Check if instance was created
+                image_query_instance.status = 'failed'
+                image_query_instance.extracted_text = f"OCR processing error: {str(e)[:100]}" # Store a snippet of error
+                image_query_instance.save(update_fields=['extracted_text', 'status', 'updated_at'])
+            # This exception itself isn't directly returned to the client by perform_create.
+            # The create method below handles the response.
+
+    def create(self, request, *args, **kwargs):
+        """
+        Handles image upload, OCR processing, and returns the ImageQuery instance.
+        """
+        serializer = self.get_serializer(data=request.data) # Uses ImageQueryUploadSerializer
+        serializer.is_valid(raise_exception=True)
+        # perform_create will be called by super().create() or by us directly if we override.
+        # To return the full ImageQuerySerializer output, we need to manage instance handling.
+
+        # Manually call perform_create to get the instance
+        # This is because perform_create does the actual work and saves the instance.
+        # We need the instance *after* perform_create has updated it with OCR results.
+        self.perform_create(serializer)
+        instance_with_ocr_result = serializer.instance # This is the saved & processed instance
+
+        # Now serialize this instance with the display serializer
+        response_serializer = ImageQuerySerializer(instance_with_ocr_result)
+        headers = self.get_success_headers(response_serializer.data)
+        return Response(response_serializer.data, status=http_status.HTTP_201_CREATED, headers=headers)

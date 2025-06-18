@@ -80,6 +80,54 @@ class AIQuerySerializer(serializers.Serializer):
     query = serializers.CharField(max_length=2000, help_text="The user's query for the AI tutor.")
 
 
+# --- AI Feedback Serializer ---
+from .models import AIFeedback # Import AIFeedback
+
+class AIFeedbackSerializer(serializers.ModelSerializer):
+    user = serializers.HiddenField(default=serializers.CurrentUserDefault())
+    # Ensure user is read-only if set by default, or not included in 'fields' if purely backend set.
+    # CurrentUserDefault handles setting it, so it doesn't need to be in request payload.
+    context_vector_ids = serializers.ListField(
+       child=serializers.CharField(max_length=255),
+       required=False,
+       write_only=True, # Processed in create, not stored directly on AIFeedback model as a field
+       help_text="List of vector_ids for DocumentChunks that were used as context."
+    )
+    ai_low_confidence = serializers.BooleanField(required=False, default=False,
+                                               help_text="Indicates if the AI response was flagged for low confidence (can be set by user or system).")
+
+    class Meta:
+        model = AIFeedback
+        fields = ['id', 'user', 'session_id', 'query_text', 'ai_response_text',
+                  'rating', 'feedback_comment', 'interaction_type',
+                  'context_vector_ids', 'ai_low_confidence', 'context_chunks', 'timestamp']
+        read_only_fields = ['user', 'timestamp', 'id', 'context_chunks']
+        # context_chunks is populated from context_vector_ids in create method
+
+    def validate_rating(self, value):
+        if value is not None and not (1 <= value <= 5):
+            raise serializers.ValidationError("Rating must be an integer between 1 and 5.")
+        return value
+
+    def create(self, validated_data):
+        context_vector_ids = validated_data.pop('context_vector_ids', [])
+        # User is already handled by CurrentUserDefault via HiddenField
+        # ai_low_confidence is directly passed to model if present in validated_data
+
+        feedback_instance = AIFeedback.objects.create(**validated_data)
+
+        if context_vector_ids:
+            # Ensure DocumentChunk is imported at the top of serializers.py if not already
+            # from .models import DocumentChunk (already there for other serializers)
+            chunks = DocumentChunk.objects.filter(vector_id__in=context_vector_ids)
+            if chunks.exists():
+                feedback_instance.context_chunks.set(chunks)
+            else:
+                logger.warning(f"AIFeedback create: No DocumentChunks found for vector_ids: {context_vector_ids} for feedback {feedback_instance.id}")
+
+        return feedback_instance
+
+
 # --- Mock Exam Serializers ---
 
 class MockExamQuestionSerializer(serializers.ModelSerializer):
@@ -120,6 +168,25 @@ class MockExamAttemptSerializer(serializers.ModelSerializer):
         fields = ['id', 'user', 'mock_exam', 'mock_exam_title', 'start_time', 'end_time', 'score', 'status', 'created_at']
         read_only_fields = ['start_time', 'end_time', 'score', 'user', 'mock_exam', 'mock_exam_title', 'created_at']
         # Status can be updated by the system (e.g., from 'in_progress' to 'completed').
+
+
+# --- Image Query OCR Serializers ---
+from .models import ImageQuery # Import ImageQuery
+
+class ImageQuerySerializer(serializers.ModelSerializer): # For displaying results
+    user = serializers.StringRelatedField(read_only=True)
+    # image_url = serializers.ImageField(source='image', read_only=True) # Alternative if just URL needed
+    image = serializers.ImageField(read_only=True) # Provides full URL for image
+
+    class Meta:
+        model = ImageQuery
+        fields = ['id', 'user', 'image', 'extracted_text', 'status', 'timestamp', 'updated_at']
+        read_only_fields = ['id', 'user', 'extracted_text', 'status', 'timestamp', 'updated_at', 'image']
+
+class ImageQueryUploadSerializer(serializers.ModelSerializer): # For uploading image
+    class Meta:
+        model = ImageQuery
+        fields = ['image'] # Only allow image upload for creation
 
 class AnswerSubmissionSerializer(serializers.Serializer):
     question_id = serializers.IntegerField()
