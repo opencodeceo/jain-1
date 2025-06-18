@@ -1,4 +1,10 @@
-# AI-Powered Exam Preparation App: Comprehensive Documentation
+---
+applyTo: "**"
+---
+
+Coding standards, domain knowledge, and preferences that AI should follow.
+
+# Examify: AI-Powered Exam Preparation App: Comprehensive Documentation
 
 ## 1. Project Overview
 
