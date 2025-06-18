@@ -406,3 +406,109 @@ Answer:"""
 
 # Conceptual placeholders for signal or model method integration
 # ... (as before)
+
+
+def grade_answer_with_ai(question_text, question_type, user_answer_text, question_points, options=None, context_text=None):
+    if not user_answer_text or not user_answer_text.strip():
+        logger.info(f"AI Grading: No answer provided for Q='{question_text[:30]}...'")
+        return {
+            'feedback': "No answer provided by the user.", # More specific feedback
+            'points_awarded': 0.0
+        }
+
+    llm_provider = getattr(settings, 'PREFERRED_LLM_PROVIDER', 'google') # Default to google if not set
+    logger.info(f"AI Grading: Q='{question_text[:50]}...' A='{user_answer_text[:50]}...' using {llm_provider}. Points: {question_points}")
+
+    prompt_parts = [
+        f"You are an AI grading assistant. Evaluate the user's answer for the following question.",
+        f"Question: {question_text}",
+    ]
+
+    options_text_for_prompt = ""
+    if question_type == 'multiple_choice' and options and isinstance(options, dict):
+        formatted_options = []
+        for key, value in options.items():
+            if key.lower() not in ['correct', 'options_text', 'explanation']: # Exclude special/meta keys
+                formatted_options.append(f"{key}) {value}")
+        if formatted_options:
+            options_text_for_prompt = " ".join(formatted_options)
+            prompt_parts.append(f"Options provided to user: {options_text_for_prompt}")
+        # For MCQs, user_answer_text is expected to be the chosen option's text or key.
+        # If it's a key, the LLM might need the option text to understand the choice.
+        # The calling code in submit_answers now passes the option text as user_answer_text for MCQs.
+        prompt_parts.append(f"User's Answer/Selected Option: '{user_answer_text}'")
+
+    elif question_type in ['short_answer', 'essay']:
+        prompt_parts.append(f"User's Answer: {user_answer_text}")
+
+    if context_text:
+        prompt_parts.append(f"Relevant Context from Study Material (use this to validate the answer if applicable): {context_text}")
+
+    prompt_parts.append(f"The question is worth {question_points} points.")
+
+    if question_type in ['short_answer', 'essay']:
+        prompt_parts.append(
+            f"Provide constructive feedback on the user's answer. "
+            f"Then, on a new line, strictly output 'Awarded Points: X' where X is the number of points awarded out of {question_points}. "
+            f"X should be an integer or a float (e.g., Awarded Points: {float(question_points)/2.0}). Base your grading on accuracy, completeness, and relevance to the question and provided context (if any)."
+        )
+    else: # For MCQs, AI provides feedback/explanation, not points.
+         prompt_parts.append(
+            f"Provide a brief explanation for why the user's selection might be correct or incorrect, or offer additional insights related to the question and options. "
+            f"Do not award points for multiple-choice questions in your response." # Points are auto-graded by the system.
+         )
+
+    prompt = "\n\n".join(prompt_parts)
+    logger.debug(f"AI Grading Prompt for Q='{question_text[:50]}...':\n{prompt}")
+
+    raw_llm_response = get_llm_response(prompt, provider=llm_provider)
+
+    if raw_llm_response is None or (isinstance(raw_llm_response, str) and raw_llm_response.startswith("Error:")):
+        logger.error(f"LLM error during AI grading for Q='{question_text[:50]}...': {raw_llm_response}")
+        return {
+            'feedback': f"Automated grading failed due to an AI service error: {raw_llm_response}",
+            'points_awarded': 0.0 # Default to 0 if AI fails for open-ended
+        }
+
+    feedback_parts = []
+    awarded_points_value = 0.0
+    parsed_points_successfully = False
+
+    lines = raw_llm_response.splitlines()
+    for line in lines:
+        # Normalize line for robust parsing
+        normalized_line = line.lower().strip()
+        if normalized_line.startswith("awarded points:"):
+            try:
+                points_str = normalized_line.replace("awarded points:", "").strip()
+                awarded_points_value = float(points_str)
+                # Clamp points to be within 0 and question_points
+                awarded_points_value = min(max(0.0, awarded_points_value), float(question_points))
+                parsed_points_successfully = True
+                logger.info(f"AI Grading: Parsed points '{awarded_points_value}' from LLM line: '{line}'")
+            except ValueError:
+                logger.warning(f"AI Grading: Could not parse points from LLM line: '{line}' for Q='{question_text[:50]}...'")
+        else:
+            feedback_parts.append(line)
+
+    final_feedback = "\n".join(feedback_parts).strip()
+    if not final_feedback : # Ensure there's some feedback text
+        if question_type in ['short_answer', 'essay'] and parsed_points_successfully:
+             final_feedback = "Grading complete. Please review the awarded points."
+        elif question_type == 'multiple_choice':
+             final_feedback = "Feedback for your choice." # Generic for MCQ if LLM gives no text part
+        else:
+             final_feedback = "AI feedback could not be fully parsed or was not provided."
+
+        if not parsed_points_successfully and question_type in ['short_answer', 'essay']:
+             final_feedback += " Points could not be determined by AI."
+
+
+    # For MCQs, points are auto-graded by the view; AI only provides feedback. So, return None for points.
+    points_to_return = awarded_points_value if question_type in ['short_answer', 'essay'] and parsed_points_successfully else None
+
+    logger.info(f"AI Grading result for Q='{question_text[:50]}...' - Feedback: '{final_feedback[:50]}...', Points from AI: {points_to_return}")
+    return {
+        'feedback': final_feedback,
+        'points_awarded': points_to_return # This will be None for MCQs
+    }

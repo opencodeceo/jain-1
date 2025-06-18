@@ -198,10 +198,10 @@ from rest_framework.views import APIView
 # from rest_framework.response import Response # Already imported
 # from rest_framework import status # Already imported as http_status
 # from rest_framework import permissions # Already imported
-from .serializers import AIQuerySerializer # Import the new serializer
-from .ai_processing import perform_rag_query # Import the RAG service
-from django.conf import settings # To access settings for API key checks
-import logging # Import logging
+from .serializers import AIQuerySerializer
+from .ai_processing import perform_rag_query, grade_answer_with_ai # Import grade_answer_with_ai
+from django.conf import settings
+import logging
 
 logger = logging.getLogger(__name__) # Define logger for this module
 
@@ -297,3 +297,263 @@ class AITutorQueryView(APIView):
                     status=http_status.HTTP_500_INTERNAL_SERVER_ERROR
                 )
         return Response(serializer.errors, status=http_status.HTTP_400_BAD_REQUEST)
+
+
+# --- Mock Exam Views ---
+from django.utils import timezone
+from .models import MockExam, MockExamAttempt, MockExamQuestion, MockExamAnswer # Add new models
+from .serializers import (MockExamListSerializer, MockExamDetailSerializer, # Add new serializers
+                          MockExamAttemptSerializer, MockExamSubmissionSerializer)
+
+
+class MockExamViewSet(viewsets.ReadOnlyModelViewSet):
+    """
+    Provides API endpoints for listing and retrieving Mock Exams.
+
+    Mock exams are collections of questions designed to help users prepare.
+    Users can view available exams and start new attempts.
+    Creation of Mock Exams and their Questions is typically handled via the Django Admin interface.
+    """
+    queryset = MockExam.objects.all().order_by('-created_at')
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get_serializer_class(self):
+        """
+        Returns the serializer class to be used for the current action.
+        - `list`: Uses `MockExamListSerializer` for a summarized view.
+        - `retrieve`: Uses `MockExamDetailSerializer` for a detailed view including questions.
+        """
+        if self.action == 'list':
+            return MockExamListSerializer
+        return MockExamDetailSerializer # For retrieve (detail view)
+
+    @action(detail=True, methods=['post'], url_path='start-attempt', serializer_class=MockExamAttemptSerializer)
+    def start_attempt(self, request, pk=None):
+        """
+        Starts a new mock exam attempt for the authenticated user for the specified mock exam.
+
+        If an 'in_progress' attempt by the same user for the same exam already exists,
+        details of that existing attempt are returned. Otherwise, a new attempt is created.
+
+        **Response (New Attempt):**
+        - `201 Created`: If a new attempt is successfully started.
+          ```json
+          {
+              "id": 1,
+              "user": "username",
+              "mock_exam_title": "Test Exam 1",
+              "mock_exam": 1, // ID of the mock exam
+              "start_time": "YYYY-MM-DDTHH:MM:SS.ffffffZ",
+              "end_time": null,
+              "score": null,
+              "status": "in_progress",
+              "created_at": "YYYY-MM-DDTHH:MM:SS.ffffffZ"
+          }
+          ```
+        **Response (Existing Attempt):**
+        - `200 OK`: If an existing 'in_progress' attempt is found.
+          ```json
+          {
+              "message": "You have an ongoing attempt for this exam.",
+              "attempt_id": 1,
+              "details": { /* Full MockExamAttemptSerializer data for the existing attempt */ }
+          }
+          ```
+        - `404 Not Found`: If the specified mock exam does not exist.
+        """
+        mock_exam = self.get_object()
+        user = request.user
+
+        existing_attempt = MockExamAttempt.objects.filter(user=user, mock_exam=mock_exam, status='in_progress').first()
+        if existing_attempt:
+            serializer = self.get_serializer(existing_attempt) # Use get_serializer for action context
+            return Response({
+                "message": "You have an ongoing attempt for this exam.",
+                "attempt_id": existing_attempt.id,
+                "details": serializer.data
+            }, status=http_status.HTTP_200_OK)
+
+        attempt = MockExamAttempt.objects.create(user=user, mock_exam=mock_exam, status='in_progress')
+        serializer = self.get_serializer(attempt) # Use get_serializer for action context
+        return Response(serializer.data, status=http_status.HTTP_201_CREATED)
+
+
+class MockExamAttemptViewSet(viewsets.GenericViewSet,
+                             viewsets.mixins.RetrieveModelMixin):
+    """
+    Provides API endpoints for managing and submitting Mock Exam Attempts.
+    Users can retrieve their attempts and submit answers.
+    """
+    queryset = MockExamAttempt.objects.all()
+    serializer_class = MockExamAttemptSerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get_queryset(self):
+        """
+        Users can only access their own mock exam attempts.
+        """
+        return MockExamAttempt.objects.filter(user=self.request.user).order_by('-start_time')
+
+    # RetrieveModelMixin provides the 'retrieve' action:
+    # GET /api/core/mockexam-attempts/{id}/
+    # It will use the self.serializer_class (MockExamAttemptSerializer) by default.
+    # The get_queryset method ensures users can only retrieve their own attempts.
+
+    @action(detail=True, methods=['post'], url_path='submit', serializer_class=MockExamSubmissionSerializer)
+    def submit_answers(self, request, pk=None):
+        """
+        Submits answers for a given mock exam attempt.
+        The attempt must be 'in_progress' and belong to the authenticated user.
+
+        The system performs auto-grading for multiple-choice questions and uses AI for feedback
+        and grading of short answer/essay questions.
+
+        **Request Body:**
+        ```json
+        {
+            "answers": [
+                {
+                    "question_id": 1,
+                    "selected_choice_key": "B"
+                },
+                {
+                    "question_id": 2,
+                    "answer_text": "This is my detailed answer for the short question."
+                }
+            ]
+        }
+        ```
+
+        **Response:**
+        - `200 OK`: Answers successfully submitted and processed.
+          ```json
+          {
+              "message": "Answers submitted and processed.",
+              "attempt": { /* Updated MockExamAttempt data with score and status='completed' */ }
+          }
+          ```
+        - `400 Bad Request`: Invalid input, attempt not in progress, or other submission errors.
+        - `403 Forbidden`: If the user does not own the attempt.
+        - `404 Not Found`: If the attempt does not exist.
+        - `503 Service Unavailable`: If AI grading services are unavailable or misconfigured.
+        """
+        attempt = self.get_object()
+
+        if attempt.user != request.user:
+            # This check is technically redundant if get_queryset is correctly filtering,
+            # but kept for explicitness, especially if an admin user could somehow hit this.
+            logger.warning(f"User {request.user.id} tried to submit to attempt {attempt.id} owned by {attempt.user.id}")
+            return Response({"error": "You do not have permission to submit to this attempt."}, status=http_status.HTTP_403_FORBIDDEN)
+
+        if attempt.status != 'in_progress':
+            logger.warning(f"Attempt to submit answers for already processed attempt {attempt.id} (status: {attempt.status}) by user {request.user.id}")
+            return Response({"error": f"This attempt is not in progress (current status: {attempt.status}) and cannot be submitted to."}, status=http_status.HTTP_400_BAD_REQUEST)
+
+        submission_serializer = self.get_serializer(data=request.data) # Uses action's serializer_class
+        if not submission_serializer.is_valid():
+            return Response(submission_serializer.errors, status=http_status.HTTP_400_BAD_REQUEST)
+
+        answers_data = submission_serializer.validated_data['answers']
+
+        # --- Start of complex logic from previous step (AI-Graded Feedback) ---
+        answers_to_create_later = []
+
+        for answer_data_item in answers_data: # Renamed answer_data to answer_data_item for clarity
+            try:
+                question = MockExamQuestion.objects.get(id=answer_data_item['question_id'], mock_exam=attempt.mock_exam)
+            except MockExamQuestion.DoesNotExist:
+                logger.warning(f"Question ID {answer_data_item['question_id']} not found for exam {attempt.mock_exam.id} by user {request.user.id}.")
+                continue
+
+            current_points_for_answer = 0.0
+            is_answer_correct = None
+            feedback_text = ""
+
+            user_text_answer = answer_data_item.get('answer_text', '')
+            user_mcq_key = answer_data_item.get('selected_choice_key')
+
+            content_for_ai_grading = user_text_answer
+
+            if question.question_type == 'multiple_choice':
+                if question.options and 'correct' in question.options:
+                    correct_key = question.options.get('correct')
+                    if user_mcq_key == correct_key:
+                        is_answer_correct = True
+                        current_points_for_answer = float(question.points)
+                    else:
+                        is_answer_correct = False
+                        current_points_for_answer = 0.0
+                else:
+                    logger.warning(f"MCQ Question ID {question.id} has no 'correct' key in options. Auto-grading for points might be inaccurate.")
+                    current_points_for_answer = 0.0
+
+                if user_mcq_key and question.options and user_mcq_key in question.options:
+                    option_value = question.options.get(user_mcq_key)
+                    if isinstance(option_value, str):
+                        content_for_ai_grading = option_value
+                    else:
+                        content_for_ai_grading = user_mcq_key
+                        logger.info(f"MCQ option text for key '{user_mcq_key}' not found or not string for QID {question.id}. Sending key to AI.")
+                elif user_mcq_key:
+                     content_for_ai_grading = user_mcq_key
+                else:
+                    content_for_ai_grading = ""
+
+            context_text_for_ai = None
+            if question.original_material_chunk:
+                try:
+                    if question.original_material_chunk.chunk_text:
+                         context_text_for_ai = question.original_material_chunk.chunk_text
+                except Exception as e:
+                    logger.error(f"Error fetching context from original_material_chunk for AI grading (QID {question.id}): {e}", exc_info=True)
+
+            if content_for_ai_grading.strip() or question.question_type in ['short_answer', 'essay']:
+                 ai_grading_result = grade_answer_with_ai(
+                    question_text=question.question_text,
+                    question_type=question.question_type,
+                    user_answer_text=content_for_ai_grading,
+                    question_points=float(question.points),
+                    options=question.options if question.question_type == 'multiple_choice' else None,
+                    context_text=context_text_for_ai
+                )
+                 feedback_text = ai_grading_result.get('feedback', "AI feedback processing error.")
+                 ai_awarded_points = ai_grading_result.get('points_awarded')
+
+                 if question.question_type in ['short_answer', 'essay'] and ai_awarded_points is not None:
+                    current_points_for_answer = float(ai_awarded_points)
+                    is_answer_correct = True if current_points_for_answer >= (float(question.points) / 2.0) else False
+            elif question.question_type in ['short_answer', 'essay'] and not content_for_ai_grading.strip():
+                feedback_text = "No answer was provided by the user for this question."
+                current_points_for_answer = 0.0
+                is_answer_correct = False
+
+            answers_to_create_later.append(
+                MockExamAnswer(
+                    attempt=attempt,
+                    question=question,
+                    answer_text=user_text_answer,
+                    selected_choice_key=user_mcq_key,
+                    is_correct=is_answer_correct,
+                    points_awarded=current_points_for_answer,
+                    feedback=feedback_text
+                )
+            )
+
+        if answers_to_create_later:
+            MockExamAnswer.objects.bulk_create(answers_to_create_later)
+            logger.info(f"Bulk created {len(answers_to_create_later)} answers for attempt {attempt.id}")
+
+        final_total_score = 0.0
+        all_attempt_answers = MockExamAnswer.objects.filter(attempt=attempt)
+        for ans in all_attempt_answers:
+            if ans.points_awarded is not None:
+                final_total_score += ans.points_awarded
+
+        attempt.score = final_total_score
+        attempt.end_time = timezone.now()
+        attempt.status = 'completed'
+        attempt.save()
+        # --- End of complex logic from previous step ---
+
+        result_serializer = MockExamAttemptSerializer(attempt) # Use the ViewSet's default serializer for the attempt
+        return Response({"message": "Answers submitted and processed.", "attempt": result_serializer.data}, status=http_status.HTTP_200_OK)
