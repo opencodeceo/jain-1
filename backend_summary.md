@@ -26,6 +26,7 @@ This document summarizes the features implemented in Phase 1 of the Examify Djan
     *   Generated using `drf-yasg` with detailed docstrings in views and serializers.
 *   **Unit Tests:**
     *   A foundational suite of unit and integration tests covering user authentication, profile updates, material uploads, and the review process.
+    *   Test suites (`tests_phase3.py`) added for mock exam system, progress tracking, and gamification signals.
     *   **Mock Exam System:**
         *   Users can list available mock exams.
         *   Users can retrieve detailed information for a specific mock exam, including its questions.
@@ -51,6 +52,26 @@ This document summarizes the features implemented in Phase 1 of the Examify Djan
     *   **Study Groups (Foundation):**
         *   Basic models (`StudyGroup`, `StudyGroupMembership`) have been implemented to support future study group functionality.
         *   Groups and memberships can be managed by administrators via the Django Admin. User-facing APIs for group interaction are deferred.
+*   **Phase 4: AI Model Integration & Continuous Learning**
+    *   **Task-Specific Routing for LLMs:**
+        *   Refined `get_llm_response` in `core.ai_processing` to accept a `task_type` parameter.
+        *   For OpenAI, this allows dynamic adjustment of the system message based on the task (e.g., 'summarize', 'explain_complex', 'generate_questions', 'rag_query', 'grade_answer').
+        *   New AI service functions added:
+            *   `summarize_text_with_llm`: Generates concise summaries of provided text. Exposed via API at `/api/core/studymaterials/{id}/summarize/`.
+            *   `explain_complex_problem_with_llm`: Provides step-by-step explanations for user queries, optionally using context. (Internal logic, not yet a direct public API).
+            *   `generate_questions_from_text_with_llm`: Generates exam-style questions (MCQ, short answer) from text content in a structured JSON format. (Internal logic, not yet a direct public API).
+    *   **User Feedback Mechanism:**
+        *   `AIFeedback` model implemented to store user feedback on AI interactions.
+        *   Includes fields for `session_id` (linking to a specific RAG query), `query_text`, `ai_response_text`, `rating` (1-5), `feedback_comment`, `interaction_type`, and linked `context_chunks`.
+        *   API endpoint `/api/core/ai/feedback/` (POST) allows authenticated users to submit feedback.
+        *   `AITutorQueryView` response now includes a `session_id` to facilitate feedback submission.
+    *   **Content Highlighting & Active Learning (Basic):**
+        *   `DocumentChunk` model updated with `review_flags_count` (PositiveIntegerField).
+        *   A Django signal on `AIFeedback` creation increments `review_flags_count` for associated `DocumentChunk`s if the feedback indicates a low rating (<=2) or if `AIFeedback.ai_low_confidence` is true. This helps identify chunks that might need review.
+    *   **OCR for Image-Based Assistance:**
+        *   `ImageQuery` model created to store uploaded images, their OCR processing status, and extracted text.
+        *   Utilizes Google Cloud Vision API (via `extract_text_from_image_gcp` in `core.ai_processing`) for text extraction.
+        *   API endpoint `/api/core/ai/ocr-query/` (POST) allows users to upload images and receive extracted text. OCR processing is currently synchronous.
 
 ## 2. Key Algorithms and Logic
 
@@ -84,6 +105,24 @@ This document summarizes the features implemented in Phase 1 of the Examify Djan
     *   Creates `ActivityLog` entries detailing the action and points awarded.
     *   Atomically updates `UserProfile.total_points` using `F()` expressions.
     *   Includes logic to prevent awarding points multiple times for the same event (e.g., for a single mock exam completion).
+*   **Task-Specific Prompt Engineering in `get_llm_response`:**
+    *   The `get_llm_response` function in `core.ai_processing` now accepts a `task_type`.
+    *   For OpenAI, this `task_type` dynamically adjusts the system message sent to the LLM (e.g., "You are an AI assistant skilled in summarizing texts concisely." for summarization). This allows for more tailored and effective LLM interactions for different AI-powered features.
+*   **AI-Powered Question Generation Logic (`generate_questions_from_text_with_llm`):**
+    *   Constructs a detailed prompt instructing the LLM to generate a specified number of questions of given types (MCQ, short answer) from a provided text.
+    *   Requests output in a structured JSON format, including question text, type, options (with correct answer for MCQs), and optional difficulty.
+    *   Includes logic to parse and validate the LLM's JSON response, cleaning common markdown artifacts and ensuring basic structure.
+*   **OCR Text Extraction Process (`extract_text_from_image_gcp` and `OCRQueryView`):**
+    *   User uploads an image via the `/api/core/ai/ocr-query/` endpoint.
+    *   The `OCRQueryView` saves an `ImageQuery` instance.
+    *   Image content is read as bytes and passed to `extract_text_from_image_gcp`.
+    *   This function uses the `google-cloud-vision` client library to call the Vision API's document text detection feature.
+    *   The extracted text (or error status) is saved back to the `ImageQuery` instance.
+*   **Feedback-Driven Content Flagging (Signals):**
+    *   A `post_save` signal on the `AIFeedback` model (`update_document_chunk_flags_on_feedback`).
+    *   If new feedback has a low rating (e.g., <=2) or the `ai_low_confidence` flag is set by the user/system:
+        *   The signal increments the `review_flags_count` on all `DocumentChunk` instances linked to that feedback via `AIFeedback.context_chunks`.
+        *   This provides a basic mechanism for identifying potentially problematic or low-quality document chunks based on user feedback or AI self-assessment.
 
 ## 3. High-Level System Flowchart
 
@@ -117,15 +156,34 @@ graph TD
         E5 --> MEA[MockExamAttempt DB Update];
         MEA --> C;
         A -->|Submit Answers| E6[/api/core/mockexam-attempts/{id}/submit/];
-        E6 --> AI_Grade[AI Grading Service];
+        E6 --> AI_Grade[AI Grading Service (core.ai_processing)];
         E6 --> ANS_DB[MockExamAnswer DB Update];
         ANS_DB --> C;
         E6 --> Prog_Sig[Signals for Progress/Points];
-        Prog_Sig --> C; # Updates UserProfile
+        Prog_Sig --> C;
+    end
+
+    subgraph "AI Tutor & Services"
+        A -->|RAG Query| E_RAG[/api/core/ai/query/];
+        E_RAG --> RAG_Proc[RAG Process (core.ai_processing)];
+        RAG_Proc --> VDB[Vertex AI Vector Search];
+        RAG_Proc --> LLM_Synth[LLM for Synthesis];
+        RAG_Proc --> C; # Fetch Document Chunks
+        A -->|Image OCR| E_OCR[/api/core/ai/ocr-query/];
+        E_OCR --> OCR_Proc[Google Cloud Vision API];
+        E_OCR --> C; # Save ImageQuery with text
+        A -->|Submit Feedback| E_Feedback[/api/core/ai/feedback/];
+        E_Feedback --> Feedback_DB[AIFeedback DB Update];
+        Feedback_DB --> C;
+        Feedback_DB --> Sig_Flag[Signal to flag DocumentChunks];
+        Sig_Flag --> C;
+        SM[StudyMaterial] -->|Summarize Action| E_Summarize[/api/core/studymaterials/{id}/summarize/];
+        E_Summarize --> LLM_Summ[LLM for Summarization];
     end
 
     M[Swagger/ReDoc UI] <--> N[drf-yasg];
     E --> N;
+    E4 --> N; E5 --> N; E6 --> N; E_RAG --> N; E_OCR --> N; E_Feedback --> N; E_Summarize --> N;
 ```
 *(Note: This is a simplified text-based flowchart. A proper diagramming tool would be better for visual representation.)*
 
@@ -147,33 +205,38 @@ graph TD
 *   **Testing:**
     *   `#issue-10`: Complete unit tests for the recommendation system (ensure it handles the new "all materials" scope correctly).
     *   `#issue-11`: Add tests for more edge cases in `StudyMaterialViewSet` access permissions.
-    *   `#issue-12`: Add comprehensive tests for Mock Exam APIs, including AI grading mocks.
-    *   `#issue-13`: Add tests for signal handlers related to progress and points.
-*   **Mock Exams (Phase 3 Enhancements):**
-    *   `#issue-P3-M01`: User ability to create/share mock exams.
-    *   `#issue-P3-M02`: More question types (e.g., fill-in-the-blanks, matching).
-    *   `#issue-P3-M03`: Timed exam interface with countdown on frontend.
-    *   `#issue-P3-M04`: Review mode for completed attempts (show questions, user answers, correct answers, feedback).
-    *   `#issue-P3-M05`: Question bank for reusing questions across exams.
-    *   `#issue-P3-M06`: Difficulty levels for questions/exams.
-*   **Progress Tracking & Gamification (Phase 3 Enhancements):**
-    *   `#issue-P3-P01`: Detailed progress dashboards/visualizations for users.
-    *   `#issue-P3-P02`: More granular progress tracking (e.g., by topic/skill based on question tags).
-    *   `#issue-P3-P03`: Badges and achievements based on points or specific accomplishments.
-    *   `#issue-P3-P04`: Leaderboards API with different scopes (overall, weekly, by course).
-*   **Study Groups (Phase 3 Enhancements):**
-    *   `#issue-P3-S01`: API endpoints for users to create, list, join, and leave study groups.
-    *   `#issue-P3-S02`: Functionality for group discussions (e.g., message threads within groups).
-    *   `#issue-P3-S03`: Resource sharing within study groups.
-    *   `#issue-P3-S04`: Group-specific mock exams or challenges.
-*   **AI Integration (Beyond Phase 1/2):**
-    *   `#issue-AI-01`: Integrate NLP for analyzing uploaded materials (as per project doc - was #issue-12).
-    *   `#issue-AI-02`: Develop AI Tutor endpoint using a chosen AI model (Gemini, Grok, OpenAI - was #issue-13, now partially done with RAG).
-    *   `#issue-AI-03`: Implement OCR for image-based assistance (was #issue-14).
-    *   `#issue-AI-04`: AI-powered question generation from study materials.
+    *   `#issue-12`: Add comprehensive tests for Mock Exam APIs, including AI grading mocks (partially done in tests_phase3.py).
+    *   `#issue-13`: Add tests for signal handlers related to progress and points (partially done in tests_phase3.py).
+    *   `#issue-14`: Add tests for new Phase 4 AI services (Summarization, OCR, Feedback API, Task-Specific LLM routing - created as tests_phase4.py).
+*   **Mock Exams (Further Enhancements):**
+    *   `#issue-M01`: User ability to create/share mock exams (was #issue-P3-M01).
+    *   `#issue-M02`: More question types (e.g., fill-in-the-blanks, matching) (was #issue-P3-M02).
+    *   `#issue-M03`: Timed exam interface with countdown on frontend (was #issue-P3-M03).
+    *   `#issue-M04`: Review mode for completed attempts (show questions, user answers, correct answers, feedback) (was #issue-P3-M04).
+    *   `#issue-M05`: Question bank for reusing questions across exams (was #issue-P3-M05).
+    *   `#issue-M06`: Difficulty levels for questions/exams (was #issue-P3-M06).
+*   **Progress Tracking & Gamification (Further Enhancements):**
+    *   `#issue-P01`: Detailed progress dashboards/visualizations for users (was #issue-P3-P01).
+    *   `#issue-P02`: More granular progress tracking (e.g., by topic/skill based on question tags) (was #issue-P3-P02).
+    *   `#issue-P03`: Badges and achievements based on points or specific accomplishments (was #issue-P3-P03).
+    *   `#issue-P04`: Leaderboards API with different scopes (overall, weekly, by course) (was #issue-P3-P04).
+*   **Study Groups (Further Enhancements):**
+    *   `#issue-S01`: API endpoints for users to create, list, join, and leave study groups (was #issue-P3-S01).
+    *   `#issue-S02`: Functionality for group discussions (e.g., message threads within groups) (was #issue-P3-S02).
+    *   `#issue-S03`: Resource sharing within study groups (was #issue-P3-S03).
+    *   `#issue-S04`: Group-specific mock exams or challenges (was #issue-P3-S04).
+*   **AI Integration & Continuous Learning (Phase 4 Enhancements & Beyond):**
+    *   `#issue-AI-01`: Integrate NLP for analyzing uploaded materials (as per project doc).
+    *   `#issue-AI-02`: Further refine AI Tutor RAG capabilities (was partially #issue-AI-02).
+    *   `#issue-AI-03`: Full operationalization of OCR for image-based assistance and integration into RAG.
+    *   `#issue-AI-04`: API endpoints for AI-powered question generation from study materials (using `generate_questions_from_text_with_llm`).
+    *   `#issue-AI-05`: API endpoint for complex problem explanation (using `explain_complex_problem_with_llm`).
+    *   `#issue-AI-06`: Admin interface for reviewing `DocumentChunk`s flagged by `review_flags_count`.
+    *   `#issue-AI-07`: Mechanism to incorporate `AIFeedback` into model fine-tuning or prompt refinement (closing the loop).
+    *   `#issue-AI-08`: Explore using AI confidence scores (if available from models) to populate `AIFeedback.ai_low_confidence` automatically.
 *   **Deployment & DevOps:**
-    *   `#issue-DO-01`: Configure production settings (e.g., database, static files, media storage with cloud services - was #issue-15).
-    *   `#issue-DO-02`: Set up CI/CD pipeline (was #issue-16).
+    *   `#issue-DO-01`: Configure production settings (e.g., database, static files, media storage with cloud services).
+    *   `#issue-DO-02`: Set up CI/CD pipeline.
 
 ## 5. Instructions to Run
 
