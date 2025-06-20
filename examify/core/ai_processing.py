@@ -10,6 +10,7 @@ from google.cloud.aiplatform.matching_engine import MatchingEngineIndexEndpoint
 import uuid
 from .models import DocumentChunk
 import logging
+import json
 
 # Configure a logger for this module
 logger = logging.getLogger(__name__)
